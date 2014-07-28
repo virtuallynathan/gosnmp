@@ -1,9 +1,5 @@
 package gosnmp
 
-import (
-	"log"
-)
-
 /*
 Sequence       PDUType = 0x30
 GetRequest     PDUType = 0xa0
@@ -20,7 +16,7 @@ Version2c SnmpVersion = 0x1
 */
 
 //GenPacket generates the SNMP packet, and returns it.
-func GenPacket(community string, version SnmpVersion, reqType PDUType, oids []string) []byte {
+func GenPacket(community string, version SnmpVersion, reqType PDUType, oids []string) ([]byte, error) {
 	var packet []byte
 	var pdus []SnmpPDU
 	var err error
@@ -39,7 +35,7 @@ func GenPacket(community string, version SnmpVersion, reqType PDUType, oids []st
 
 	packet, err = packetOut.marshalMsg(pdus, packetOut.PDUType, 0)
 	if err != nil {
-		log.Printf("error marshaling: %s", err.Error())
+		return nil, err
 	}
-	return packet
+	return packet, nil
 }
