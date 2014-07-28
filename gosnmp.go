@@ -10,22 +10,21 @@ package gosnmp
 
 import (
 	"fmt"
+	"io/ioutil"
+	"log"
 	"math/big"
 	"math/rand"
 	"net"
 	"strconv"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	// maxOids is the maximum number of oids allowed in a Get()
-	maxOids = 60
+	maxOids               = 60             // maxOids is the maximum number of oids allowed in a Get()
+	baseOid               = ".1.3.6.1.2.1" // Base OID for MIB-2 defined SNMP variables
+	defaultMaxRepetitions = 50             // Java SNMP uses 50, snmp-net uses 10
 
-	// Base OID for MIB-2 defined SNMP variables
-	baseOid = ".1.3.6.1.2.1"
-
-	// Java SNMP uses 50, snmp-net uses 10
-	defaultMaxRepetitions = 50
 )
 
 // LoggingDisabled is set if the Logger is nil, short circuits any 'slog' calls
@@ -33,44 +32,24 @@ var LoggingDisabled bool
 
 // GoSNMP represents GoSNMP library state
 type GoSNMP struct {
-
-	// Target is an ipv4 address
-	Target string
-
-	// Port is a udp port
-	Port uint16
-
-	// Community is an SNMP Community string
-	Community string
-
-	// Version is an SNMP Version
-	Version SnmpVersion
-
-	// Timeout is the timeout for the SNMP Query
-	Timeout time.Duration
-
-	// Set the number of retries to attempt within timeout.
-	Retries int
-
-	// Conn is net connection to use, typically establised using GoSNMP.Connect()
-	Conn net.Conn
+	Target    string        // Target is an ipv4 address
+	Port      uint16        // Port is a udp port
+	Community string        // Community is an SNMP Community string
+	Version   SnmpVersion   // Version is an SNMP Version
+	Timeout   time.Duration // Timeout is the timeout for the SNMP Query
+	Retries   int           // Set the number of retries to attempt within timeout.
+	Conn      net.Conn      // Conn is net connection to use, typically establised using GoSNMP.Connect()
 
 	// Logger is the GoSNMP.Logger to use for debugging. If nil, debugging
 	// output will be discarded (/dev/null). For verbose logging to stdout:
 	// x.Logger = log.New(os.Stdout, "", 0)
 	Logger Logger
 
-	// MaxRepititions sets the GETBULK max-repetitions used by BulkWalk*
-	// (default: 50)
-	MaxRepetitions int
+	MaxRepetitions int        // MaxRepititions sets the GETBULK max-repetitions used by BulkWalk* (default: 50)
+	NonRepeaters   int        // NonRepeaters sets the GETBULK max-repeaters used by BulkWalk* (default: 0 as per RFC 1905)
+	requestID      uint32     // Internal - used to sync requests to response
+	random         *rand.Rand // Internal - used to sync requests to responses
 
-	// NonRepeaters sets the GETBULK max-repeaters used by BulkWalk*
-	// (default: 0 as per RFC 1905)
-	NonRepeaters int
-
-	// Internal - used to sync requests to responses
-	requestID uint32
-	random    *rand.Rand
 }
 
 // The default connection settings
@@ -84,15 +63,9 @@ var Default = &GoSNMP{
 
 // SnmpPDU will be used when doing SNMP Set's
 type SnmpPDU struct {
-
-	// Name is an oid in string format eg ".1.3.6.1.4.9.27"
-	Name string
-
-	// The type of the value eg Integer
-	Type Asn1BER
-
-	// The value to be set by the SNMP set
-	Value interface{}
+	Name  string      // Name is an oid in string format eg ".1.3.6.1.4.9.27"
+	Type  Asn1BER     // The type of the value eg Integer
+	Value interface{} // The value to be set by the SNMP set
 }
 
 // Asn1BER is the type of the SNMP PDU
@@ -142,6 +115,105 @@ func (x *GoSNMP) Connect() error {
 	}
 	x.requestID = x.random.Uint32()
 	return nil
+}
+
+// send sends the SNMP packet generated in the other functions and recieves a result
+func (x *GoSNMP) send(pdus []SnmpPDU, packetOut *SnmpPacket) (result *SnmpPacket, err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			err = fmt.Errorf("recover: %v", e)
+		}
+	}()
+
+	if x.Conn == nil {
+		return nil, fmt.Errorf("&GoSNMP.Conn is missing. Provide a connection or use Connect()")
+	}
+
+	if x.Logger == nil {
+		x.Logger = log.New(ioutil.Discard, "", 0)
+	}
+	slog = x.Logger // global variable for debug logging
+
+	finalDeadline := time.Now().Add(x.Timeout)
+
+	if x.Retries < 0 {
+		x.Retries = 0
+	}
+	allReqIDs := make([]uint32, 0, x.Retries+1)
+	for retries := 0; ; retries++ {
+		if retries > 0 {
+			if LoggingDisabled != true {
+				slog.Printf("Retry number %d. Last error was: %v", retries, err)
+			}
+			if time.Now().After(finalDeadline) {
+				err = fmt.Errorf("Request timeout (after %d retries)", retries-1)
+				break
+			}
+			if retries > x.Retries {
+				// Report last error
+				break
+			}
+		}
+		err = nil
+
+		reqDeadline := time.Now().Add(x.Timeout / time.Duration(x.Retries+1))
+		x.Conn.SetDeadline(reqDeadline)
+
+		// Request ID is an atomic counter (started at a random value)
+		reqID := atomic.AddUint32(&(x.requestID), 1)
+		allReqIDs = append(allReqIDs, reqID)
+
+		var outBuf []byte
+		outBuf, err = packetOut.marshalMsg(pdus, packetOut.PDUType, reqID)
+		if err != nil {
+			// Don't retry - not going to get any better!
+			err = fmt.Errorf("marshal: %v", err)
+			break
+		}
+		_, err = x.Conn.Write(outBuf)
+		if err != nil {
+			err = fmt.Errorf("Error writing to socket: %s", err.Error())
+			continue
+		}
+
+		// FIXME: If our packet exceeds our buf size we'll get a partial read
+		// and this request, and the next will fail. The correct logic would be
+		// to realloc and read more if pack len > buff size.
+		resp := make([]byte, rxBufSize, rxBufSize)
+		var n int
+		n, err = x.Conn.Read(resp)
+		if err != nil {
+			err = fmt.Errorf("Error reading from UDP: %s", err.Error())
+			continue
+		}
+
+		result, err = unmarshal(resp[:n])
+		if err != nil {
+			err = fmt.Errorf("Unable to decode packet: %s", err.Error())
+			continue
+		}
+		if result == nil || len(result.Variables) < 1 {
+			err = fmt.Errorf("Unable to decode packet: nil")
+			continue
+		}
+
+		validID := false
+		for _, id := range allReqIDs {
+			if id == result.RequestID {
+				validID = true
+			}
+		}
+		if !validID {
+			err = fmt.Errorf("Out of order response")
+			continue
+		}
+
+		// Success!
+		return result, nil
+	}
+
+	// Return last error
+	return nil, err
 }
 
 // Get sends an SNMP GET request
