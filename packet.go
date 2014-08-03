@@ -67,7 +67,6 @@ func SendPacket(packet []byte, conn net.Conn) (result *SnmpPacket, err error) {
 		conn.Close()
 		return nil, err
 	}
-	conn.Close()
 
 	result, err = unmarshal(resp[:n])
 	if err != nil {
@@ -78,5 +77,7 @@ func SendPacket(packet []byte, conn net.Conn) (result *SnmpPacket, err error) {
 		err = fmt.Errorf("Unable to decode packet: nil")
 		return nil, err
 	}
+	conn.Close()
+
 	return result, nil
 }
