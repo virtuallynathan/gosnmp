@@ -47,6 +47,11 @@ func GenPacket(community string, version SnmpVersion, reqType PDUType, oids []st
 
 //SendPacket sends a packet generated with GenPacket, or other functions
 func SendPacket(packet []byte, conn net.Conn) (result *SnmpPacket, err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			err = fmt.Errorf("recover: %v", e)
+		}
+	}()
 	if conn == nil {
 		return nil, fmt.Errorf("&GoSNMP.Conn is missing. Provide a connection or use Connect()")
 	}
@@ -64,7 +69,6 @@ func SendPacket(packet []byte, conn net.Conn) (result *SnmpPacket, err error) {
 	n, err = conn.Read(resp)
 	if err != nil {
 		err = fmt.Errorf("Error reading from UDP: %s", err.Error())
-		conn.Close()
 		return nil, err
 	}
 
@@ -77,7 +81,5 @@ func SendPacket(packet []byte, conn net.Conn) (result *SnmpPacket, err error) {
 		err = fmt.Errorf("Unable to decode packet: nil")
 		return nil, err
 	}
-	conn.Close()
-
 	return result, nil
 }
