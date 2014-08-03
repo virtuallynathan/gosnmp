@@ -64,8 +64,10 @@ func SendPacket(packet []byte, conn net.Conn) (result *SnmpPacket, err error) {
 	n, err = conn.Read(resp)
 	if err != nil {
 		err = fmt.Errorf("Error reading from UDP: %s", err.Error())
+		conn.Close()
 		return nil, err
 	}
+	conn.Close()
 
 	result, err = unmarshal(resp[:n])
 	if err != nil {
